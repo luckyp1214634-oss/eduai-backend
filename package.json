@@ -12,6 +12,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.3.1"
   }
 }
