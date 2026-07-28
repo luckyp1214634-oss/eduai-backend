@@ -138,8 +138,9 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
   }
 
   try {
-    const { subject, topic, difficulty, count } = req.body || {};
+    const { subject, topic, difficulty, count, language } = req.body || {};
     const wantCount = Math.min(Math.max(parseInt(count, 10) || 10, 1), 20);
+    const wantLang = (language || 'english').toLowerCase();
 
     if (!subject) {
       return res.status(400).json({ success: false, error: 'subject is required.' });
@@ -153,10 +154,12 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
     if (topic) {
       query = query.where('topic', '==', topic);
     }
-    query = query.limit(60);
+    query = query.limit(100);
 
     const snapshot = await query.get();
-    let existing = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    let allMatching = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    // Older seeded PYQs have no `language` field — treat those as English.
+    let existing = allMatching.filter(q => (q.language || 'english').toLowerCase() === wantLang);
     shuffleArray(existing);
 
     if (existing.length >= wantCount) {
@@ -171,6 +174,7 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
 
     // 2. Not enough cached — top up with AI, but only within the daily cap.
     const shortfall = wantCount - existing.length;
+
     const allowed = await tryReserveAIQuota(shortfall > 0 ? 1 : 0);
 
     if (!allowed) {
@@ -182,7 +186,7 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
       });
     }
 
-    const generated = await generateQuestionsWithAI(subject, topic, diff, shortfall);
+    const generated = await generateQuestionsWithAI(subject, topic, diff, shortfall, wantLang);
 
     const batch = db.batch();
     const savedQuestions = [];
@@ -195,6 +199,7 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
         correctIndex: q.correctIndex,
         explanation: q.explanation || '',
         source: 'ai',
+        language: wantLang,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       };
       batch.set(ref, doc);
@@ -214,6 +219,52 @@ app.post('/api/quiz-questions', checkAppAuth, async (req, res) => {
 // =====================================================================
 // Admin-only: seed real PYQ questions (never called from the app itself)
 // =====================================================================
+// =====================================================================
+// Quiz result history (simple, name-based — no full user auth yet)
+// =====================================================================
+app.post('/api/save-result', checkAppAuth, async (req, res) => {
+  if (!db) {
+    return res.status(500).json({ success: false, error: 'Question bank not configured yet.' });
+  }
+  try {
+    const { name, subject, topic, score, total, language } = req.body || {};
+    if (!name || !subject || score === undefined || total === undefined) {
+      return res.status(400).json({ success: false, error: 'name, subject, score, total are required.' });
+    }
+    await db.collection('quiz_results').add({
+      name, subject, topic: topic || null, score, total,
+      language: language || 'english',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('save-result error:', err);
+    return res.status(500).json({ success: false, error: 'Server error, please try again.' });
+  }
+});
+
+app.post('/api/my-results', checkAppAuth, async (req, res) => {
+  if (!db) {
+    return res.status(500).json({ success: false, error: 'Question bank not configured yet.' });
+  }
+  try {
+    const { name } = req.body || {};
+    if (!name) {
+      return res.status(400).json({ success: false, error: 'name is required.' });
+    }
+    const snapshot = await db.collection('quiz_results')
+      .where('name', '==', name)
+      .orderBy('createdAt', 'desc')
+      .limit(20)
+      .get();
+    const results = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    return res.json({ success: true, results });
+  } catch (err) {
+    console.error('my-results error:', err);
+    return res.status(500).json({ success: false, error: 'Server error, please try again.' });
+  }
+});
+
 app.post('/api/seed-questions', checkAdminAuth, async (req, res) => {
   if (!db) {
     return res.status(500).json({ success: false, error: 'Question bank not configured yet.' });
@@ -272,13 +323,18 @@ async function callGemini(parts) {
     data.candidates[0].content.parts[0].text;
 }
 
-async function generateQuestionsWithAI(subject, topic, difficulty, count) {
+async function generateQuestionsWithAI(subject, topic, difficulty, count, language) {
+  const langInstruction = (language === 'hindi')
+    ? 'Write the questionText, options, and explanation in simple Hindi (Devanagari script), suitable for Indian students.'
+    : 'Write the questionText, options, and explanation in plain English.';
+
   const prompt =
     `Generate ${count} multiple-choice questions for JEE/NEET/Class 11-12 students in India.\n` +
-    `Subject: ${subject}\nTopic: ${topic}\nDifficulty: ${difficulty}\n\n` +
+    `Subject: ${subject}\nTopic: ${topic}\nDifficulty: ${difficulty}\n${langInstruction}\n\n` +
     `Respond with ONLY a valid JSON array, no markdown fences, no extra text, in exactly this shape:\n` +
     `[{"questionText":"...","options":["A","B","C","D"],"correctIndex":0,"explanation":"..."}]\n` +
-    `correctIndex is 0-based (0,1,2,3). Keep questionText and options in plain text, no LaTeX, no markdown.`;
+    `correctIndex is 0-based (0,1,2,3). STRICT: use plain text only for all math — write x^2 as "x squared" ` +
+    `or "x*x", never use symbols like ^, _, {, }, $, ~, #, @, or markdown formatting (** or ##) anywhere.`;
 
   const text = await callGemini([{ text: prompt }]);
   const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -286,7 +342,24 @@ async function generateQuestionsWithAI(subject, topic, difficulty, count) {
   if (!Array.isArray(parsed)) {
     throw new Error('AI did not return a JSON array');
   }
-  return parsed;
+  // Extra safety net: strip any stray symbols the model slipped in anyway.
+  return parsed.map(q => ({
+    questionText: stripStraySymbols(q.questionText),
+    options: (q.options || []).map(stripStraySymbols),
+    correctIndex: q.correctIndex,
+    explanation: stripStraySymbols(q.explanation || '')
+  }));
+}
+
+function stripStraySymbols(text) {
+  if (typeof text !== 'string') {
+    return text;
+  }
+  return text
+    .replace(/\*\*/g, '')
+    .replace(/[\^_{}$~#@]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function shuffleArray(arr) {
@@ -318,5 +391,3 @@ async function tryReserveAIQuota(amount) {
 app.listen(PORT, () => {
   console.log('EduAI backend listening on port', PORT);
 });
-    
-                 
