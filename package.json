@@ -1,4 +1,4 @@
-{
+ {
   "name": "eduai-backend",
   "version": "1.0.0",
   "private": true,
@@ -15,4 +15,4 @@
     "dotenv": "^16.4.5",
     "firebase-admin": "^12.3.1"
   }
-}
+ }
